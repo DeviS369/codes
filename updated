@@ -1,0 +1,89 @@
+import pandas as pd
+from datetime import datetime
+from django.db import transaction
+
+def blg_ware():
+    today = pd.to_datetime(datetime.today().date())
+    data = {"IT_PULLOUT": []}
+    
+    # Load data
+    supplyon, pullout = call_data(supplyon_bmw, data)
+    
+    # Clean and convert fields
+    supplyon['delivery_date'] = pd.to_datetime(
+        supplyon['delivery_date'].replace('Backorder', pd.NaT), errors='coerce')
+    supplyon = supplyon.dropna(subset=['delivery_date'])
+    supplyon['delivery_quantity'] = pd.to_numeric(supplyon['delivery_quantity'], errors='coerce').fillna(0)
+    supplyon['next_git_wh_qty'] = pd.to_numeric(supplyon['next_git_wh_qty'], errors='coerce').fillna(0)
+
+    pullout['con_date'] = pd.to_datetime(pullout['con_date'], errors='coerce')
+    pullout['FKIMG'] = pd.to_numeric(pullout['FKIMG'], errors='coerce').fillna(0)
+
+    pullout.loc[
+        (pullout['con_date'].notna()) &
+        (pullout['con_date'] < today) &
+        (pullout['RECEP_FLG'] != 'X'),
+        'RECEP_FLG'
+    ] = 'X'
+
+    # Compute total_blg per buyer_article_no
+    blg_df = pullout[pullout['RECEP_FLG'] == 'X'].groupby(
+        'buyer_article_no', as_index=False)['FKIMG'].sum()
+    blg_df = blg_df.rename(columns={'FKIMG': 'total_blg'})
+    
+    # Merge and filter
+    supplyon = pd.merge(supplyon, blg_df, how='left', on='buyer_article_no')
+    supplyon['total_blg'] = supplyon['total_blg'].fillna(0)
+    supplyon = supplyon[supplyon['delivery_date'] >= today]
+    supplyon = supplyon.sort_values(['buyer_article_no', 'delivery_date'])
+
+    update_records = []
+
+    # Process per buyer_article_no
+    for article, group in supplyon.groupby('buyer_article_no'):
+        group = group.copy().sort_values('delivery_date')
+        group['month'] = group['delivery_date'].dt.to_period('M')
+        total_blg = group['total_blg'].iloc[0]
+        group['blg_warehouse_stock'] = 0
+
+        # Start with total_blg in first delivery
+        current_stock = total_blg
+
+        # Process month by month
+        for month, month_group in group.groupby('month'):
+            month_indices = month_group.index.tolist()
+
+            for i, idx in enumerate(month_indices):
+                row = group.loc[idx]
+
+                if i == 0 and month == group['month'].min():
+                    # First delivery in first month: assign total_blg
+                    group.at[idx, 'blg_warehouse_stock'] = current_stock
+                else:
+                    # Subtract delivery_quantity from previous stock
+                    current_stock -= group.at[idx, 'delivery_quantity']
+                    group.at[idx, 'blg_warehouse_stock'] = current_stock
+
+                # If last delivery in the month, add next_git_wh_qty
+                if i == len(month_indices) - 1:
+                    current_stock += row['next_git_wh_qty']
+
+        # Update DB records
+        latest = bmw_warehouse.objects.filter(
+            buyer_article_no=article
+        ).order_by('-entry_date').first()
+        latest_stock = int(latest.warehouse_qty) if latest else 0
+
+        for idx, row in group.iterrows():
+            try:
+                rec = supplyon_bmw.objects.get(pk=row['id'])
+                rec.blg_warehouse_stock = int(row['blg_warehouse_stock'])
+                rec.warehouse_stock = latest_stock
+                update_records.append(rec)
+            except supplyon_bmw.DoesNotExist:
+                continue
+
+    if update_records:
+        with transaction.atomic():
+            supplyon_bmw.objects.bulk_update(update_records, ["blg_warehouse_stock", "warehouse_stock"])
+        print(f"✅ Updated {len(update_records)} future delivery records.")
